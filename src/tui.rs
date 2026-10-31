@@ -17,6 +17,13 @@ use std::collections::HashSet;
 use std::io;
 use std::path::PathBuf;
 
+pub struct PreviewState {
+    pub session_id: String,
+    pub title: String,
+    pub lines: Vec<Line<'static>>,
+    pub scroll: u16,
+}
+
 pub struct AppState {
     pub opencode_db: PathBuf,
     pub freebuff_dir: Option<PathBuf>,
@@ -28,6 +35,7 @@ pub struct AppState {
     pub delete_source: bool,
     pub status_message: Option<(String, Color)>,
     pub modal_dialog: Option<String>,
+    pub preview: Option<PreviewState>,
     pub should_quit: bool,
 }
 
@@ -54,6 +62,7 @@ impl AppState {
             delete_source: false,
             status_message: None,
             modal_dialog: None,
+            preview: None,
             should_quit: false,
         })
     }
@@ -134,6 +143,145 @@ impl AppState {
             TargetPlatform::Agy => TargetPlatform::Both,
             TargetPlatform::Both => TargetPlatform::Freebuff,
         };
+    }
+
+    pub fn toggle_preview(&mut self) {
+        if self.preview.is_some() {
+            self.preview = None;
+            return;
+        }
+
+        let sel = match self.list_state.selected() {
+            Some(i) => self.sessions.get(i),
+            None => None,
+        };
+
+        if let Some(meta) = sel {
+            if let Ok(Some(full)) = opencode::load_full_session(&self.opencode_db, &meta.session_id)
+            {
+                let mut lines: Vec<Line<'static>> = Vec::new();
+
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        "=== Session: ",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        full.session_id.clone(),
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!(
+                            " | Model: {} | Messages: {} ===",
+                            full.model,
+                            full.messages.len()
+                        ),
+                        Style::default().fg(Color::Cyan),
+                    ),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::styled("Directory: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(full.directory.clone(), Style::default().fg(Color::Gray)),
+                ]));
+                lines.push(Line::from(""));
+
+                if full.messages.is_empty() {
+                    lines.push(Line::from(Span::styled(
+                        "(No messages in this session)",
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
+
+                for (idx, msg) in full.messages.iter().enumerate() {
+                    let is_user = msg.role == "user";
+                    let role_style = if is_user {
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::Green)
+                            .add_modifier(Modifier::BOLD)
+                    };
+
+                    let time_str = if msg.time_created > 0 {
+                        chrono::DateTime::<chrono::Utc>::from_timestamp(msg.time_created / 1000, 0)
+                            .map(|d| d.format("%H:%M:%S").to_string())
+                            .unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
+
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            format!(" #{} ", idx + 1),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                        Span::styled(format!(" {} ", msg.role.to_uppercase()), role_style),
+                        Span::styled(
+                            format!("  {}", time_str),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                    ]));
+
+                    let reasoning = msg.get_reasoning_text();
+                    if !reasoning.is_empty() {
+                        lines.push(Line::from(Span::styled(
+                            "  [Thought / Reasoning]",
+                            Style::default()
+                                .fg(Color::Magenta)
+                                .add_modifier(Modifier::ITALIC),
+                        )));
+                        for r_line in reasoning.lines() {
+                            lines.push(Line::from(Span::styled(
+                                format!("    {}", r_line),
+                                Style::default().fg(Color::Rgb(170, 140, 200)),
+                            )));
+                        }
+                    }
+
+                    let visible = msg.get_visible_text();
+                    let content = if visible.is_empty() {
+                        msg.get_full_text()
+                    } else {
+                        visible
+                    };
+                    for c_line in content.lines() {
+                        lines.push(Line::from(Span::styled(
+                            format!("  {}", c_line),
+                            if is_user {
+                                Style::default().fg(Color::White)
+                            } else {
+                                Style::default().fg(Color::Rgb(210, 230, 255))
+                            },
+                        )));
+                    }
+
+                    lines.push(Line::from(Span::styled(
+                        "─".repeat(70),
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
+
+                self.preview = Some(PreviewState {
+                    session_id: full.session_id,
+                    title: full.title,
+                    lines,
+                    scroll: 0,
+                });
+            } else {
+                self.status_message = Some((
+                    "Failed to load conversation details.".to_string(),
+                    Color::Red,
+                ));
+            }
+        }
     }
 
     pub fn run_migration(&mut self) {
@@ -266,6 +414,37 @@ pub fn run_tui(mut state: AppState) -> Result<(), io::Error> {
                     continue;
                 }
 
+                if let Some(ref mut prev) = state.preview {
+                    match key.code {
+                        KeyCode::Esc
+                        | KeyCode::Char('q')
+                        | KeyCode::Char('p')
+                        | KeyCode::Char('P') => {
+                            state.preview = None;
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            prev.scroll = prev.scroll.saturating_sub(1);
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            prev.scroll = prev.scroll.saturating_add(1);
+                        }
+                        KeyCode::PageUp => {
+                            prev.scroll = prev.scroll.saturating_sub(15);
+                        }
+                        KeyCode::PageDown => {
+                            prev.scroll = prev.scroll.saturating_add(15);
+                        }
+                        KeyCode::Home | KeyCode::Char('g') => {
+                            prev.scroll = 0;
+                        }
+                        KeyCode::End | KeyCode::Char('G') => {
+                            prev.scroll = prev.lines.len().saturating_sub(10) as u16;
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => {
                         state.should_quit = true;
@@ -281,6 +460,9 @@ pub fn run_tui(mut state: AppState) -> Result<(), io::Error> {
                     }
                     KeyCode::Char('a') => {
                         state.toggle_all();
+                    }
+                    KeyCode::Char('p') | KeyCode::Char('P') | KeyCode::Char('v') => {
+                        state.toggle_preview();
                     }
                     KeyCode::Tab | KeyCode::Right | KeyCode::Left => {
                         state.cycle_target();
@@ -449,8 +631,19 @@ fn ui(f: &mut Frame, state: &mut AppState) {
                 ]),
                 Line::from(""),
                 Line::from(vec![
-                    Span::styled("Tip: ", Style::default().fg(Color::Yellow)),
-                    Span::raw("Press Space to select, Enter or 'm' to migrate."),
+                    Span::styled(
+                        " [p] 💬 Preview Conversation ",
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(" (Press 'p' to view all messages)"),
+                ]),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("Tip: ", Style::default().fg(Color::Cyan)),
+                    Span::raw("Space: select, Tab: target, d: move/copy, Enter: migrate"),
                 ]),
             ]
         } else {
@@ -525,6 +718,13 @@ fn ui(f: &mut Frame, state: &mut AppState) {
             Span::raw(" Move | "),
             Span::styled("Space", Style::default().fg(Color::Yellow)),
             Span::raw(" Select | "),
+            Span::styled(
+                "p",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" Preview | "),
             Span::styled("a", Style::default().fg(Color::Yellow)),
             Span::raw(" All | "),
             Span::styled("Tab", Style::default().fg(Color::Yellow)),
@@ -549,6 +749,32 @@ fn ui(f: &mut Frame, state: &mut AppState) {
             .title(" Controls & Settings "),
     );
     f.render_widget(bottom_widget, chunks[2]);
+
+    // --- Conversation Full Preview Modal ---
+    if let Some(prev) = &state.preview {
+        let area = centered_rect(88, 85, size);
+        f.render_widget(Clear, area);
+
+        let title = format!(
+            " 💬 Preview: {} ({}) [↑/↓/PgUp/PgDn: Scroll | Line: {} | 'p'/Esc: Close] ",
+            prev.title, prev.session_id, prev.scroll
+        );
+
+        let preview_dialog = Paragraph::new(prev.lines.clone())
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(title)
+                    .border_style(
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+            )
+            .scroll((prev.scroll, 0))
+            .wrap(Wrap { trim: false });
+        f.render_widget(preview_dialog, area);
+    }
 
     // --- Modal Dialog Popup ---
     if let Some(msg) = &state.modal_dialog {
