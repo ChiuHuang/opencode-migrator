@@ -180,5 +180,93 @@ pub fn import_session(session: &OpenCodeSession, agy_root: &Path) -> Result<Stri
         ],
     ).map_err(|e| e.to_string())?;
 
+    // Create conversations/<conv_id>.db so AGY can find the conversation locally.
+    // Without this file, AGY logs "conversation not found locally" and ignores --conversation.
+    create_conversation_db(&conv_id, agy_root)?;
+
     Ok(conv_id)
+}
+
+/// Creates conversations/<conv_id>.db with the schema AGY expects.
+fn create_conversation_db(conv_id: &str, agy_root: &Path) -> Result<(), String> {
+    let conv_dir = agy_root.join("conversations");
+    fs::create_dir_all(&conv_dir).map_err(|e| e.to_string())?;
+
+    let db_path = conv_dir.join(format!("{}.db", conv_id));
+    // If already exists leave it alone (don't overwrite a real conversation)
+    if db_path.exists() {
+        return Ok(());
+    }
+
+    let db = Connection::open(&db_path).map_err(|e| e.to_string())?;
+
+    db.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS trajectory_meta (
+            trajectory_id TEXT,
+            cascade_id    TEXT,
+            trajectory_type INTEGER,
+            source        INTEGER,
+            PRIMARY KEY (trajectory_id)
+        );
+        CREATE TABLE IF NOT EXISTS steps (
+            idx            INTEGER,
+            step_type      INTEGER NOT NULL DEFAULT 0,
+            status         INTEGER NOT NULL DEFAULT 0,
+            has_subtrajectory NUMERIC NOT NULL DEFAULT false,
+            metadata       BLOB,
+            error_details  BLOB,
+            permissions    BLOB,
+            task_details   BLOB,
+            render_info    BLOB,
+            step_payload   BLOB,
+            step_format    INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (idx)
+        );
+        CREATE TABLE IF NOT EXISTS gen_metadata (
+            idx  INTEGER,
+            data BLOB,
+            size INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (idx)
+        );
+        CREATE TABLE IF NOT EXISTS executor_metadata (
+            idx  INTEGER,
+            data BLOB,
+            PRIMARY KEY (idx)
+        );
+        CREATE TABLE IF NOT EXISTS parent_references (
+            idx  INTEGER,
+            data BLOB,
+            PRIMARY KEY (idx)
+        );
+        CREATE TABLE IF NOT EXISTS trajectory_metadata_blob (
+            id   TEXT DEFAULT 'main',
+            data BLOB,
+            PRIMARY KEY (id)
+        );
+        CREATE TABLE IF NOT EXISTS battle_mode_infos (
+            idx  INTEGER,
+            data BLOB,
+            PRIMARY KEY (idx)
+        );
+    "#,
+    )
+    .map_err(|e| e.to_string())?;
+
+    // trajectory_type 4 = CASCADE (normal conversation), source 17 = CLI
+    let traj_id = Uuid::new_v4().to_string();
+    db.execute(
+        "INSERT INTO trajectory_meta (trajectory_id, cascade_id, trajectory_type, source) VALUES (?1, ?2, 4, 17)",
+        params![traj_id, conv_id],
+    ).map_err(|e| e.to_string())?;
+
+    // A minimal trajectory_metadata_blob so AGY doesn't reject the DB on load
+    // Field 4 = trajectory_type varint (encoded below as proto varint 4)
+    db.execute(
+        "INSERT INTO trajectory_metadata_blob (id, data) VALUES ('main', x'2004')",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+
+    Ok(())
 }

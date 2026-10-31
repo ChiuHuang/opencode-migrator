@@ -52,6 +52,7 @@ pub fn find_opencode_db(custom: Option<&str>) -> Option<PathBuf> {
     candidates.into_iter().find(|c| c.is_file())
 }
 
+/// Returns the Freebuff Desktop config dir (~/.config/freebuff-desktop or %APPDATA%\freebuff-desktop).
 pub fn find_freebuff_dir(custom: Option<&str>) -> Option<PathBuf> {
     if let Some(c) = custom {
         let p = PathBuf::from(c);
@@ -87,6 +88,25 @@ pub fn find_freebuff_dir(custom: Option<&str>) -> Option<PathBuf> {
         }
     }
     candidates.into_iter().next()
+}
+
+/// Returns the Freebuff CLI (manicode) config dir (~/.config/manicode or FREEBUFF_CONFIG_DIR).
+/// This is where `freebuff` CLI stores chat history (chat-messages.json / chat-meta.json).
+pub fn find_manicode_dir() -> Option<PathBuf> {
+    // Respect the same env var that freebuff CLI uses
+    if let Ok(dir) = std::env::var("FREEBUFF_CONFIG_DIR") {
+        let p = PathBuf::from(&dir);
+        if p.is_absolute() {
+            return Some(p);
+        }
+    }
+
+    if let Some(home) = dirs::home_dir() {
+        let p = home.join(".config").join("manicode");
+        return Some(p);
+    }
+
+    None
 }
 
 pub fn find_agy_dir(custom: Option<&str>) -> Option<PathBuf> {

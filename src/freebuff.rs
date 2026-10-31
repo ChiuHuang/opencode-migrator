@@ -1,4 +1,5 @@
 use crate::models::{FreebuffPart, OpenCodeSession};
+use crate::paths::find_manicode_dir;
 use rusqlite::{params, Connection, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -352,5 +353,178 @@ pub fn import_session(session: &OpenCodeSession, fb_root: &Path) -> Result<Strin
         .map_err(|e| e.to_string())?;
     }
 
+    // Also import to Freebuff CLI (manicode) if it exists
+    let _ = import_session_manicode(session);
+
     Ok(thread_id)
+}
+
+// ---------------------------------------------------------------------------
+// Freebuff CLI (manicode) import
+// Writes chat-messages.json + chat-meta.json in the format freebuff CLI reads.
+// Path: ~/.config/manicode/projects/<basename>/chats/<ISO-timestamp>/
+// ---------------------------------------------------------------------------
+
+/// A single message entry as freebuff CLI expects.
+#[derive(serde::Serialize)]
+struct ManicodeChatMessage {
+    id: String,
+    variant: String, // "user" | "ai"
+    content: String,
+    timestamp: i64, // milliseconds epoch
+}
+
+pub fn import_session_manicode(session: &OpenCodeSession) -> Result<String, String> {
+    let manicode_dir = match find_manicode_dir() {
+        Some(d) => d,
+        None => return Err("Could not locate manicode config dir".to_string()),
+    };
+
+    // Project slug = basename of session directory
+    let proj_slug = Path::new(&session.directory)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("workspace")
+        .to_string();
+
+    let chats_dir = manicode_dir.join("projects").join(&proj_slug).join("chats");
+    fs::create_dir_all(&chats_dir).map_err(|e| e.to_string())?;
+
+    // Chat directory name: ISO-8601 timestamp with colons replaced by dashes
+    // Use the session's creation time (same as freebuff CLI does for new chats)
+    let created_ms = if session.time_created > 0 {
+        session.time_created
+    } else {
+        chrono::Utc::now().timestamp_millis()
+    };
+
+    let chat_id = {
+        use chrono::{DateTime, Utc};
+        let dt = DateTime::<Utc>::from_timestamp(
+            created_ms / 1000,
+            ((created_ms % 1000) * 1_000_000) as u32,
+        )
+        .unwrap_or_else(Utc::now);
+        // freebuff CLI format: "2026-10-31T09-05-44.141Z"
+        format!(
+            "{}.{}Z",
+            dt.format("%Y-%m-%dT%H-%M-%S"),
+            (created_ms % 1000)
+        )
+    };
+
+    let chat_dir = chats_dir.join(&chat_id);
+    fs::create_dir_all(&chat_dir).map_err(|e| e.to_string())?;
+
+    // Build chat-messages.json
+    let mut messages: Vec<ManicodeChatMessage> = Vec::new();
+    for msg in &session.messages {
+        let variant = if msg.role == "user" { "user" } else { "ai" }.to_string();
+        let content = {
+            let v = msg.get_visible_text();
+            if v.is_empty() {
+                msg.get_full_text()
+            } else {
+                v
+            }
+        };
+        if content.is_empty() {
+            continue;
+        }
+        let ts = if msg.time_created > 0 {
+            msg.time_created
+        } else {
+            created_ms
+        };
+        let id = format!("{}-{}", variant, ts);
+        messages.push(ManicodeChatMessage {
+            id,
+            variant,
+            content,
+            timestamp: ts,
+        });
+    }
+
+    if messages.is_empty() {
+        return Err("No messages to export".to_string());
+    }
+
+    let messages_json = serde_json::to_string(&messages).map_err(|e| e.to_string())?;
+    let messages_file = chat_dir.join("chat-messages.json");
+    fs::write(&messages_file, &messages_json).map_err(|e| e.to_string())?;
+
+    // Build chat-meta.json — freebuff CLI validates messagesSize and messagesMtimeMs!
+    let messages_size = messages_json.len() as u64;
+    let messages_mtime_ms = {
+        use std::time::SystemTime;
+        messages_file
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(created_ms)
+    };
+
+    // firstPrompt: first user message, truncated to 97 chars with "..." if over 100
+    let first_prompt: String = messages
+        .iter()
+        .find(|m| m.variant == "user")
+        .map(|m| {
+            let s = m.content.trim().to_string();
+            if s.len() > 100 {
+                format!("{}...", &s[..97])
+            } else {
+                s
+            }
+        })
+        .unwrap_or_else(|| "(empty chat)".to_string());
+
+    let meta = serde_json::json!({
+        "messageCount": messages.len(),
+        "firstPrompt": first_prompt,
+        "messagesSize": messages_size,
+        "messagesMtimeMs": messages_mtime_ms
+    });
+    let meta_file = chat_dir.join("chat-meta.json");
+    fs::write(
+        &meta_file,
+        serde_json::to_string(&meta).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+
+    // Update recent-projects.json
+    let recent_file = manicode_dir.join("recent-projects.json");
+    let project_path = PathBuf::from(&session.directory)
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(&session.directory))
+        .to_string_lossy()
+        .to_string();
+
+    let mut recent: Vec<serde_json::Value> = recent_file
+        .is_file()
+        .then(|| fs::read_to_string(&recent_file).ok())
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .and_then(|v: serde_json::Value| v.as_array().cloned())
+        .unwrap_or_default();
+
+    // Remove existing entry for same path, then prepend fresh one
+    recent.retain(|e| e.get("path").and_then(|p| p.as_str()) != Some(&project_path));
+    recent.insert(
+        0,
+        serde_json::json!({
+            "path": project_path,
+            "lastOpened": chrono::Utc::now().timestamp_millis()
+        }),
+    );
+    // Keep at most 10 (same as freebuff CLI constant QoL=10)
+    recent.truncate(10);
+
+    let _ = fs::write(
+        &recent_file,
+        serde_json::to_string_pretty(&recent).unwrap_or_default(),
+    );
+
+    Ok(chat_id)
 }
