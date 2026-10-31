@@ -1,0 +1,21 @@
+[package]
+name = "opencode-migrator"
+version = "0.1.0"
+edition = "2021"
+authors = ["ChiuHuang <test.foxcat@gmail.com>"]
+description = "Migrate OpenCode sessions to Freebuff or AGY (Antigravity) with a Ratatui TUI"
+
+[[bin]]
+name = "agc"
+path = "src/main.rs"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+uuid = { version = "1.10", features = ["v4", "v5"] }
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "5.0"
+clap = { version = "4.5", features = ["derive"] }
